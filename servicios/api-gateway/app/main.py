@@ -1,9 +1,9 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 import httpx
 
 app = FastAPI(
     title="DevSecOps RBAC API Gateway",
-    version="0.2.0",
+    version="0.3.0",
 )
 
 SERVICES = {
@@ -41,6 +41,56 @@ async def service_health(service: str):
             "service": service,
             "service_status": response.json(),
         }
+
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Service unavailable: {service}",
+        ) from exc
+
+
+@app.api_route(
+    "/api/{service}/{path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+)
+async def proxy_request(
+    service: str,
+    path: str,
+    request: Request,
+):
+    if service not in SERVICES:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown service: {service}",
+        )
+
+    url = f"{SERVICES[service]}/{path}"
+
+    body = await request.body()
+
+    headers = dict(request.headers)
+    headers.pop("host", None)
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.request(
+                method=request.method,
+                url=url,
+                content=body,
+                headers=headers,
+                params=request.query_params,
+            )
+
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            headers={
+                "content-type": response.headers.get(
+                    "content-type",
+                    "application/json",
+                )
+            },
+        )
 
     except httpx.RequestError as exc:
         raise HTTPException(

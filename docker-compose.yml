@@ -118,6 +118,9 @@ services:
       context: ./servicios/identity-service
     container_name: identity-service
     restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+psycopg://${IDENTITY_DB_USER}:${IDENTITY_DB_PASSWORD}@identity-db:5432/${IDENTITY_DB_NAME}
+      JWT_SECRET: ${JWT_SECRET}
     networks:
       - backend
 
@@ -130,6 +133,9 @@ services:
       context: ./servicios/rbac-service
     container_name: rbac-service
     restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+psycopg://${RBAC_DB_USER}:${RBAC_DB_PASSWORD}@rbac-db:5432/${RBAC_DB_NAME}
+      JWT_SECRET: ${JWT_SECRET}
     networks:
       - backend
 
