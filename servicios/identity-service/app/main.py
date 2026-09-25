@@ -6,15 +6,15 @@ from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pwdlib import PasswordHash
 from pydantic import BaseModel, ConfigDict, EmailStr
-from sqlalchemy import String, create_engine, select
-from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
+from sqlalchemy import Boolean, ForeignKey, String, create_engine, select
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 
 JWT_SECRET = os.environ["JWT_SECRET"]
 JWT_ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -28,6 +28,16 @@ class Base(DeclarativeBase):
     pass
 
 
+class Company(Base):
+    __tablename__ = "companies"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    name: Mapped[str] = mapped_column(String(150), unique=True, index=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    users: Mapped[list["User"]] = relationship(back_populates="company")
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -37,7 +47,28 @@ class User(Base):
     full_name: Mapped[str] = mapped_column(String(150))
     password_hash: Mapped[str] = mapped_column(String(255))
     role: Mapped[str] = mapped_column(String(30), default="viewer")
-    is_active: Mapped[bool] = mapped_column(default=True)
+
+    company_id: Mapped[int | None] = mapped_column(
+        ForeignKey("companies.id"),
+        nullable=True,
+        index=True,
+    )
+
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    company: Mapped["Company"] = relationship(back_populates="users")
+
+
+class CompanyCreate(BaseModel):
+    name: str
+
+
+class CompanyResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    is_active: bool
 
 
 class UserCreate(BaseModel):
@@ -45,7 +76,8 @@ class UserCreate(BaseModel):
     email: EmailStr
     full_name: str
     password: str
-    role: str = "viewer"
+    role: str = "user"
+    company_id: int
 
 
 class UserResponse(BaseModel):
@@ -56,6 +88,7 @@ class UserResponse(BaseModel):
     email: EmailStr
     full_name: str
     role: str
+    company_id: int
     is_active: bool
 
 
@@ -64,9 +97,20 @@ class TokenResponse(BaseModel):
     token_type: str
 
 
+class MeResponse(BaseModel):
+    id: int
+    username: str
+    email: EmailStr
+    full_name: str
+    role: str
+    company_id: int | None
+    company_name: str | None
+    is_active: bool
+
+
 app = FastAPI(
     title="Identity Service",
-    version="0.2.0",
+    version="0.3.0",
 )
 
 
@@ -88,10 +132,15 @@ def create_access_token(user: User) -> str:
         "sub": str(user.id),
         "username": user.username,
         "role": user.role,
+        "company_id": user.company_id,
         "exp": expire,
     }
 
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return jwt.encode(
+        payload,
+        JWT_SECRET,
+        algorithm=JWT_ALGORITHM,
+    )
 
 
 def get_current_user(
@@ -141,12 +190,86 @@ def health():
     }
 
 
+def require_superadmin(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    if current_user.role != "superadmin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Superadmin privileges required",
+        )
+
+    return current_user
+
+
+def require_company_admin(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    if current_user.role not in {"superadmin", "admin"}:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Administrator privileges required",
+        )
+
+    return current_user
+
+
+@app.post(
+    "/companies",
+    response_model=CompanyResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_company(
+    company_data: CompanyCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_superadmin),
+):
+
+    existing_company = db.scalar(
+        select(Company).where(Company.name == company_data.name)
+    )
+
+    if existing_company:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Company already registered",
+        )
+
+    company = Company(
+        name=company_data.name,
+    )
+
+    db.add(company)
+    db.commit()
+    db.refresh(company)
+
+    return company
+
+
+@app.get(
+    "/companies",
+    response_model=list[CompanyResponse],
+)
+def list_companies(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_superadmin),
+):
+
+    return db.scalars(
+        select(Company).order_by(Company.id)
+    ).all()
+
+
 @app.post(
     "/register",
     response_model=UserResponse,
     status_code=status.HTTP_201_CREATED,
 )
-def register(user_data: UserCreate, db: Session = Depends(get_db)):
+def register(
+    user_data: UserCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_company_admin),
+):
 
     existing_user = db.scalar(
         select(User).where(
@@ -161,12 +284,47 @@ def register(user_data: UserCreate, db: Session = Depends(get_db)):
             detail="Username or email already registered",
         )
 
+    company = db.get(Company, user_data.company_id)
+
+    if company is None or not company.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Company not found or inactive",
+        )
+
+    if current_user.role == "admin":
+        if current_user.company_id != user_data.company_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You cannot create users in another company",
+            )
+
+        if user_data.role == "superadmin":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Company administrators cannot create superadmins",
+            )
+
+        if user_data.role == "admin":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Company administrators cannot create other administrators",
+            )
+
+    if current_user.role == "superadmin":
+        if user_data.role not in {"admin", "user"}:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid user role",
+            )
+
     user = User(
         username=user_data.username,
         email=user_data.email,
         full_name=user_data.full_name,
         password_hash=password_hash.hash(user_data.password),
         role=user_data.role,
+        company_id=user_data.company_id,
     )
 
     db.add(user)
@@ -175,8 +333,10 @@ def register(user_data: UserCreate, db: Session = Depends(get_db)):
 
     return user
 
-
-@app.post("/login", response_model=TokenResponse)
+@app.post(
+    "/login",
+    response_model=TokenResponse,
+)
 def login(
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db),
@@ -202,6 +362,13 @@ def login(
             detail="User is inactive",
         )
 
+    if user.role != "superadmin":
+        if user.company is None or not user.company.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="User company is inactive",
+            )
+
     token = create_access_token(user)
 
     return {
@@ -210,6 +377,21 @@ def login(
     }
 
 
-@app.get("/me", response_model=UserResponse)
-def get_me(current_user: User = Depends(get_current_user)):
-    return current_user
+@app.get(
+    "/me",
+    response_model=MeResponse,
+)
+def get_me(
+    current_user: User = Depends(get_current_user),
+):
+
+    return {
+        "id": current_user.id,
+        "username": current_user.username,
+        "email": current_user.email,
+        "full_name": current_user.full_name,
+        "role": current_user.role,
+        "company_id": current_user.company_id,
+        "company_name": current_user.company.name if current_user.company else None,
+        "is_active": current_user.is_active,
+    }
